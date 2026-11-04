@@ -20,6 +20,7 @@ import {
   filterClaudeMdFromContext,
 } from '../lib/settings-helpers.js';
 import { validateWorkingDirectory } from '../lib/sdk-options.js';
+import { resolveCompletionStatus, type CompletionStatus } from '../lib/verification-result.js';
 import type { TypedEventBus } from './typed-event-bus.js';
 import type { FeatureStateManager } from './feature-state-manager.js';
 import type { AgentExecutor } from './agent-executor.js';
@@ -249,7 +250,7 @@ export class PipelineOrchestrator {
 
     if (pipelineInfo.stepIndex === -1) {
       logger.warn(`Step ${pipelineInfo.stepId} no longer exists, completing feature`);
-      const finalStatus = feature.skipTests ? 'waiting_approval' : 'verified';
+      const finalStatus = await this.resolveCompletionStatus(projectPath, featureId, feature);
       await this.updateFeatureStatusFn(projectPath, featureId, finalStatus);
       const runningEntryForStep = this.concurrencyManager.getRunningFeature(featureId);
       if (runningEntryForStep?.isAutoMode) {
@@ -300,7 +301,8 @@ export class PipelineOrchestrator {
         feature.excludedPipelineSteps
       );
       if (!pipelineService.isPipelineStatus(nextStatus)) {
-        await this.updateFeatureStatusFn(projectPath, featureId, nextStatus);
+        const finalStatus = await this.resolveCompletionStatus(projectPath, featureId, feature);
+        await this.updateFeatureStatusFn(projectPath, featureId, finalStatus);
         const runningEntryForExcluded = this.concurrencyManager.getRunningFeature(featureId);
         if (runningEntryForExcluded?.isAutoMode) {
           this.eventBus.emitAutoModeEvent('auto_mode_feature_complete', {
@@ -325,7 +327,7 @@ export class PipelineOrchestrator {
       .slice(startFromStepIndex)
       .filter((step) => !excludedStepIds.has(step.id));
     if (stepsToExecute.length === 0) {
-      const finalStatus = feature.skipTests ? 'waiting_approval' : 'verified';
+      const finalStatus = await this.resolveCompletionStatus(projectPath, featureId, feature);
       await this.updateFeatureStatusFn(projectPath, featureId, finalStatus);
       const runningEntryForAllExcluded = this.concurrencyManager.getRunningFeature(featureId);
       if (runningEntryForAllExcluded?.isAutoMode) {
@@ -408,7 +410,7 @@ export class PipelineOrchestrator {
 
       // Re-fetch feature to check if executePipeline set a terminal status (e.g., merge_conflict)
       const reloadedFeature = await this.featureStateManager.loadFeature(projectPath, featureId);
-      const finalStatus = feature.skipTests ? 'waiting_approval' : 'verified';
+      const finalStatus = await this.resolveCompletionStatus(projectPath, featureId, feature);
 
       // Only update status if not already in a terminal state
       if (reloadedFeature && reloadedFeature.status !== 'merge_conflict') {
@@ -532,6 +534,28 @@ export class PipelineOrchestrator {
       testsPassed: false,
       message: `Tests failed after ${maxTestAttempts} attempts`,
     };
+  }
+
+  /** Verified only when the agent reported passing verification; otherwise a human must review */
+  private async resolveCompletionStatus(
+    projectPath: string,
+    featureId: string,
+    feature: Feature
+  ): Promise<CompletionStatus> {
+    const outputPath = path.join(getFeatureDir(projectPath, featureId), 'agent-output.md');
+    let agentOutput = '';
+    try {
+      agentOutput = (await secureFs.readFile(outputPath, 'utf-8')) as string;
+    } catch (error) {
+      logger.warn(`Could not read agent output for ${featureId}, treating as unverified:`, error);
+    }
+    const { status, notVerifiedReason } = resolveCompletionStatus(feature.skipTests, agentOutput);
+    if (notVerifiedReason) {
+      logger.warn(
+        `Feature ${featureId}: ${notVerifiedReason}, setting waiting_approval instead of verified`
+      );
+    }
+    return status;
   }
 
   /** Wait for test completion */

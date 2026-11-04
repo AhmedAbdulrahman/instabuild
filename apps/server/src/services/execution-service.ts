@@ -16,6 +16,12 @@ import {
   filterClaudeMdFromContext,
 } from '../lib/settings-helpers.js';
 import { validateWorkingDirectory } from '../lib/sdk-options.js';
+import {
+  buildVerificationInstructions,
+  readVerificationResult,
+  resolveCompletionStatus,
+  type CompletionStatus,
+} from '../lib/verification-result.js';
 import { extractSummary } from './spec-parser.js';
 import type { TypedEventBus } from './typed-event-bus.js';
 import type { ConcurrencyManager, RunningFeature } from './concurrency-manager.js';
@@ -66,6 +72,17 @@ const TOOL_USE_MARKER = '🔧 Tool:';
 /** Minimum trimmed output length to consider agent work meaningful. */
 const MIN_MEANINGFUL_OUTPUT_LENGTH = 200;
 
+/**
+ * Whether the agent did meaningful work: it used tools and wrote enough output.
+ * No tool usage suggests the CLI exited without performing implementation work.
+ */
+function isMeaningfulWork(agentOutput: string): boolean {
+  return (
+    agentOutput.includes(TOOL_USE_MARKER) &&
+    agentOutput.trim().length >= MIN_MEANINGFUL_OUTPUT_LENGTH
+  );
+}
+
 export class ExecutionService {
   constructor(
     private eventBus: TypedEventBus,
@@ -96,6 +113,15 @@ export class ExecutionService {
     allowReuse?: boolean;
   }): RunningFeature {
     return this.concurrencyManager.acquire(options);
+  }
+
+  private async readAgentOutput(projectPath: string, featureId: string): Promise<string> {
+    const outputPath = path.join(getFeatureDir(projectPath, featureId), 'agent-output.md');
+    try {
+      return (await secureFs.readFile(outputPath, 'utf-8')) as string;
+    } catch {
+      return '';
+    }
   }
 
   private releaseRunningFeature(featureId: string, options?: { force?: boolean }): void {
@@ -158,7 +184,7 @@ ${feature.spec}
 
     prompt += feature.skipTests
       ? `\n${taskExecutionPrompts.implementationInstructions}`
-      : `\n${taskExecutionPrompts.implementationInstructions}\n\n${taskExecutionPrompts.playwrightVerificationInstructions}`;
+      : `\n${taskExecutionPrompts.implementationInstructions}\n\n${buildVerificationInstructions(taskExecutionPrompts.playwrightVerificationInstructions)}`;
     return prompt;
   }
 
@@ -412,6 +438,38 @@ Please continue from where you left off and complete all remaining tasks. Use th
         }
       }
 
+      // Follow-ups, resumes, planning-mode and retry runs use prompts without the
+      // verification instructions, so ask for verification in a dedicated run
+      const implementationOutput = await this.readAgentOutput(projectPath, featureId);
+      if (
+        !feature.skipTests &&
+        isMeaningfulWork(implementationOutput) &&
+        readVerificationResult(implementationOutput) === 'missing'
+      ) {
+        await this.runAgentFn(
+          workDir,
+          featureId,
+          `## Verify the Feature\n\nImplementation is complete. Verify that it works, fixing only what verification reveals.\n\n${buildVerificationInstructions(prompts.taskExecution.playwrightVerificationInstructions)}`,
+          abortController,
+          projectPath,
+          undefined,
+          model,
+          {
+            projectPath,
+            planningMode: 'skip',
+            requirePlanApproval: false,
+            previousContent: implementationOutput,
+            systemPrompt: combinedSystemPrompt || undefined,
+            autoLoadClaudeMd,
+            useClaudeCodeSystemPrompt,
+            thinkingLevel: feature.thinkingLevel,
+            reasoningEffort: feature.reasoningEffort,
+            providerId: feature.providerId,
+            branchName: feature.branchName ?? null,
+          }
+        );
+      }
+
       const pipelineConfig = await pipelineService.getPipelineConfig(projectPath);
       const excludedStepIds = new Set(feature.excludedPipelineSteps || []);
       const sortedSteps = [...(pipelineConfig?.steps || [])]
@@ -443,36 +501,30 @@ Please continue from where you left off and complete all remaining tasks. Use th
       // Read agent output before determining final status.
       // CLI-based providers (Cursor, Codex, etc.) may exit quickly without doing
       // meaningful work. Check output to avoid prematurely marking as 'verified'.
-      const outputPath = path.join(getFeatureDir(projectPath, featureId), 'agent-output.md');
-      let agentOutput = '';
-      try {
-        agentOutput = (await secureFs.readFile(outputPath, 'utf-8')) as string;
-      } catch {
-        /* */
-      }
+      const agentOutput = await this.readAgentOutput(projectPath, featureId);
 
-      // Determine if the agent did meaningful work by checking for tool usage
-      // indicators in the output. The agent executor writes "🔧 Tool:" markers
-      // each time a tool is invoked. No tool usage suggests the CLI exited
-      // without performing implementation work.
-      const hasToolUsage = agentOutput.includes(TOOL_USE_MARKER);
-      const isOutputTooShort = agentOutput.trim().length < MIN_MEANINGFUL_OUTPUT_LENGTH;
-      const agentDidWork = hasToolUsage && !isOutputTooShort;
-
-      let finalStatus: 'verified' | 'waiting_approval';
-      if (feature.skipTests) {
-        finalStatus = 'waiting_approval';
-      } else if (!agentDidWork) {
+      let finalStatus: CompletionStatus;
+      let notVerifiedReason: string | undefined;
+      if (!feature.skipTests && !isMeaningfulWork(agentOutput)) {
         // Agent didn't produce meaningful output (e.g., CLI exited quickly).
         // Route to waiting_approval so the user can review and re-run.
         finalStatus = 'waiting_approval';
         logger.warn(
           `[executeFeature] Feature ${featureId}: agent produced insufficient output ` +
-            `(${agentOutput.trim().length}/${MIN_MEANINGFUL_OUTPUT_LENGTH} chars, toolUsage=${hasToolUsage}). ` +
+            `(${agentOutput.trim().length}/${MIN_MEANINGFUL_OUTPUT_LENGTH} chars, toolUsage=${agentOutput.includes(TOOL_USE_MARKER)}). ` +
             `Setting status to waiting_approval instead of verified.`
         );
       } else {
-        finalStatus = 'verified';
+        ({ status: finalStatus, notVerifiedReason } = resolveCompletionStatus(
+          feature.skipTests,
+          agentOutput
+        ));
+        if (notVerifiedReason) {
+          logger.warn(
+            `[executeFeature] Feature ${featureId}: ${notVerifiedReason}. ` +
+              `Setting status to waiting_approval instead of verified.`
+          );
+        }
       }
 
       await this.updateFeatureStatusFn(projectPath, featureId, finalStatus);
@@ -510,6 +562,7 @@ Please continue from where you left off and complete all remaining tasks. Use th
       const elapsedSeconds = Math.round((Date.now() - tempRunningFeature.startTime) / 1000);
       let completionMessage = `Feature completed in ${elapsedSeconds}s`;
       if (finalStatus === 'verified') completionMessage += ' - auto-verified';
+      if (notVerifiedReason) completionMessage += ` - not verified: ${notVerifiedReason}`;
       if (hasIncompleteTasks)
         completionMessage += ` (${completedTasks}/${totalTasks} tasks completed)`;
 

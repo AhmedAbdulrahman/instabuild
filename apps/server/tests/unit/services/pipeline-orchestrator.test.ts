@@ -191,8 +191,10 @@ describe('PipelineOrchestrator', () => {
     mockExecuteFeatureFn = vi.fn().mockResolvedValue(undefined);
     mockRunAgentFn = vi.fn().mockResolvedValue(undefined);
 
-    // Default mocks for secureFs
-    vi.mocked(secureFs.readFile).mockResolvedValue('Previous context');
+    // Default mocks for secureFs (agent output includes a passing verification report)
+    vi.mocked(secureFs.readFile).mockResolvedValue(
+      'Previous context\n<verification>passed</verification>'
+    );
     vi.mocked(secureFs.access).mockResolvedValue(undefined);
 
     // Re-setup platform mocks (clearAllMocks resets implementations)
@@ -680,6 +682,30 @@ describe('PipelineOrchestrator', () => {
       );
     });
 
+    it('should not mark verified when step no longer exists and the agent never reported passing verification', async () => {
+      const invalidPipelineInfo: PipelineStatusInfo = {
+        ...validPipelineInfo,
+        stepIndex: -1,
+        step: null,
+      };
+      vi.mocked(secureFs.readFile).mockResolvedValue(
+        'Implemented it.\n<verification>failed</verification>'
+      );
+
+      await orchestrator.resumePipeline('/test/project', testFeature, true, invalidPipelineInfo);
+
+      expect(mockUpdateFeatureStatusFn).toHaveBeenCalledWith(
+        '/test/project',
+        'feature-1',
+        'waiting_approval'
+      );
+      expect(mockUpdateFeatureStatusFn).not.toHaveBeenCalledWith(
+        '/test/project',
+        'feature-1',
+        'verified'
+      );
+    });
+
     it('should not emit feature_complete when step no longer exists and isAutoMode=false', async () => {
       const invalidPipelineInfo: PipelineStatusInfo = {
         ...validPipelineInfo,
@@ -755,6 +781,35 @@ describe('PipelineOrchestrator', () => {
       expect(mockEventBus.emitAutoModeEvent).toHaveBeenCalledWith(
         'auto_mode_feature_complete',
         expect.objectContaining({ message: expect.stringContaining('excluded') })
+      );
+    });
+
+    it('should not mark verified when all remaining steps are excluded and the agent reported failed verification', async () => {
+      const featureWithAllExcluded: Feature = {
+        ...testFeature,
+        excludedPipelineSteps: ['step-1', 'step-2'],
+      };
+      vi.mocked(pipelineService.getNextStatus).mockReturnValue('verified');
+      vi.mocked(pipelineService.isPipelineStatus).mockReturnValue(false);
+      vi.mocked(secureFs.readFile).mockResolvedValue('<verification>failed</verification>');
+
+      await orchestrator.resumeFromStep(
+        '/test/project',
+        featureWithAllExcluded,
+        true,
+        0,
+        testConfig
+      );
+
+      expect(mockUpdateFeatureStatusFn).toHaveBeenCalledWith(
+        '/test/project',
+        'feature-1',
+        'waiting_approval'
+      );
+      expect(mockUpdateFeatureStatusFn).not.toHaveBeenCalledWith(
+        '/test/project',
+        'feature-1',
+        'verified'
       );
     });
 

@@ -40,6 +40,9 @@ import {
 import { extractSummary } from '../../../src/services/spec-parser.js';
 import { resolveModelString } from '@automaker/model-resolver';
 
+// The report an agent must emit for a Feature to become Verified
+const VERIFICATION_PASSED = '\n<verification>passed</verification>';
+
 // Mock pipelineService
 vi.mock('../../../src/services/pipeline-service.js', () => ({
   pipelineService: {
@@ -217,7 +220,8 @@ describe('execution-service.ts', () => {
     vi.mocked(secureFs.readFile).mockResolvedValue(
       'Starting implementation...\n\n🔧 Tool: Read\nInput: {"file_path": "/src/index.ts"}\n\n' +
         '🔧 Tool: Edit\nInput: {"file_path": "/src/index.ts", "old_string": "foo", "new_string": "bar"}\n\n' +
-        'Implementation complete. Updated the code as requested.'
+        'Implementation complete. Updated the code as requested.' +
+        VERIFICATION_PASSED
     );
     vi.mocked(secureFs.access).mockResolvedValue(undefined);
 
@@ -341,6 +345,19 @@ describe('execution-service.ts', () => {
       const featureWithoutTests: Feature = { ...testFeature, skipTests: true };
       const prompt = service.buildFeaturePrompt(featureWithoutTests, taskPrompts);
       expect(prompt).not.toContain('playwright instructions');
+    });
+
+    it('asks the agent to report the verification result when skipTests is false', () => {
+      const featureWithTests: Feature = { ...testFeature, skipTests: false };
+      const prompt = service.buildFeaturePrompt(featureWithTests, taskPrompts);
+      expect(prompt).toContain('<verification>passed</verification>');
+      expect(prompt).toContain('<verification>failed</verification>');
+    });
+
+    it('does not ask for a verification result when skipTests is true', () => {
+      const featureWithoutTests: Feature = { ...testFeature, skipTests: true };
+      const prompt = service.buildFeaturePrompt(featureWithoutTests, taskPrompts);
+      expect(prompt).not.toContain('<verification>');
     });
 
     it('includes images note when imagePaths present', () => {
@@ -1602,12 +1619,140 @@ describe('execution-service.ts', () => {
     };
 
     it('sets verified when agent output has tool usage and sufficient length', async () => {
-      const output = makeAgentOutput(3, 'Updated authentication module with new login flow.');
+      const output = makeAgentOutput(
+        3,
+        'Updated authentication module with new login flow.' + VERIFICATION_PASSED
+      );
       vi.mocked(secureFs.readFile).mockResolvedValue(output);
 
       await service.executeFeature('/test/project', 'feature-1');
 
       expect(mockUpdateFeatureStatusFn).toHaveBeenCalledWith(
+        '/test/project',
+        'feature-1',
+        'verified'
+      );
+    });
+
+    describe('verification run', () => {
+      // Output written by the implementation run (no report) and by a later verification run
+      const implementationOutput = makeAgentOutput(3, 'Implemented the feature.');
+      const outputAfterRuns = (verificationOutput: string) => async () =>
+        mockRunAgentFn.mock.calls.length >= 2
+          ? implementationOutput + verificationOutput
+          : implementationOutput;
+
+      it('asks the agent to verify when the implementation run reported no result', async () => {
+        vi.mocked(secureFs.readFile).mockImplementation(outputAfterRuns(VERIFICATION_PASSED));
+
+        await service.executeFeature('/test/project', 'feature-1');
+
+        expect(mockRunAgentFn).toHaveBeenCalledTimes(2);
+        const verificationPrompt = mockRunAgentFn.mock.calls[1][2] as string;
+        expect(verificationPrompt).toContain('test playwright');
+        expect(verificationPrompt).toContain('<verification>passed</verification>');
+        expect(mockUpdateFeatureStatusFn).toHaveBeenCalledWith(
+          '/test/project',
+          'feature-1',
+          'verified'
+        );
+      });
+
+      it('appends the verification run to the existing agent output', async () => {
+        vi.mocked(secureFs.readFile).mockImplementation(outputAfterRuns(VERIFICATION_PASSED));
+
+        await service.executeFeature('/test/project', 'feature-1');
+
+        expect(mockRunAgentFn.mock.calls[1][7]).toEqual(
+          expect.objectContaining({ previousContent: implementationOutput })
+        );
+      });
+
+      it('verifies follow-up runs, which use their own prompt', async () => {
+        vi.mocked(secureFs.readFile).mockImplementation(outputAfterRuns(VERIFICATION_PASSED));
+
+        await service.executeFeature('/test/project', 'feature-1', false, false, undefined, {
+          continuationPrompt: 'Also add a dark mode toggle',
+        });
+
+        expect(mockRunAgentFn).toHaveBeenCalledTimes(2);
+        expect(mockUpdateFeatureStatusFn).toHaveBeenCalledWith(
+          '/test/project',
+          'feature-1',
+          'verified'
+        );
+      });
+
+      it('sets waiting_approval when the verification run reports failure', async () => {
+        vi.mocked(secureFs.readFile).mockImplementation(
+          outputAfterRuns('\n<verification>failed</verification>')
+        );
+
+        await service.executeFeature('/test/project', 'feature-1');
+
+        expect(mockUpdateFeatureStatusFn).toHaveBeenCalledWith(
+          '/test/project',
+          'feature-1',
+          'waiting_approval'
+        );
+      });
+
+      it('skips the verification run when the agent already reported a result', async () => {
+        vi.mocked(secureFs.readFile).mockResolvedValue(implementationOutput + VERIFICATION_PASSED);
+
+        await service.executeFeature('/test/project', 'feature-1');
+
+        expect(mockRunAgentFn).toHaveBeenCalledTimes(1);
+      });
+
+      it('skips the verification run when skipTests is true', async () => {
+        vi.mocked(secureFs.readFile).mockResolvedValue(implementationOutput);
+        mockLoadFeatureFn = vi.fn().mockResolvedValue({ ...testFeature, skipTests: true });
+
+        await createServiceWithMocks().executeFeature('/test/project', 'feature-1');
+
+        expect(mockRunAgentFn).toHaveBeenCalledTimes(1);
+      });
+
+      it('skips the verification run when the agent did no work', async () => {
+        vi.mocked(secureFs.readFile).mockResolvedValue('');
+
+        await service.executeFeature('/test/project', 'feature-1');
+
+        expect(mockRunAgentFn).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    it('sets waiting_approval when the agent did work but reported no verification result', async () => {
+      vi.mocked(secureFs.readFile).mockResolvedValue(makeAgentOutput(3, 'Tests look fine to me.'));
+
+      await service.executeFeature('/test/project', 'feature-1');
+
+      expect(mockUpdateFeatureStatusFn).toHaveBeenCalledWith(
+        '/test/project',
+        'feature-1',
+        'waiting_approval'
+      );
+      expect(mockUpdateFeatureStatusFn).not.toHaveBeenCalledWith(
+        '/test/project',
+        'feature-1',
+        'verified'
+      );
+    });
+
+    it('sets waiting_approval when the agent reported failed verification', async () => {
+      vi.mocked(secureFs.readFile).mockResolvedValue(
+        makeAgentOutput(3, 'Gave up.\n<verification>failed</verification>')
+      );
+
+      await service.executeFeature('/test/project', 'feature-1');
+
+      expect(mockUpdateFeatureStatusFn).toHaveBeenCalledWith(
+        '/test/project',
+        'feature-1',
+        'waiting_approval'
+      );
+      expect(mockUpdateFeatureStatusFn).not.toHaveBeenCalledWith(
         '/test/project',
         'feature-1',
         'verified'
@@ -1689,7 +1834,7 @@ describe('execution-service.ts', () => {
       // Create output that's exactly 200 chars trimmed with tool markers
       const toolMarker = '🔧 Tool: Edit\nInput: {"file_path": "/src/index.ts"}\n';
       const padding = 'x'.repeat(200 - toolMarker.length);
-      const output = toolMarker + padding;
+      const output = toolMarker + padding + VERIFICATION_PASSED;
       expect(output.trim().length).toBeGreaterThanOrEqual(200);
 
       vi.mocked(secureFs.readFile).mockResolvedValue(output);
@@ -1820,7 +1965,8 @@ describe('execution-service.ts', () => {
         'I can see the existing component structure. Let me modify it.\n\n' +
         '🔧 Tool: Edit\nInput: {"file_path": "/src/components/App.tsx", "old_string": "const App = () => {", "new_string": "const App: React.FC = () => {"}\n\n' +
         '🔧 Tool: Write\nInput: {"file_path": "/src/components/NewFeature.tsx"}\n\n' +
-        "I've created the new component and updated the existing one. The feature is now implemented with proper TypeScript types.";
+        "I've created the new component and updated the existing one. The feature is now implemented with proper TypeScript types." +
+        VERIFICATION_PASSED;
 
       vi.mocked(secureFs.readFile).mockResolvedValue(claudeOutput);
 
@@ -1850,7 +1996,7 @@ describe('execution-service.ts', () => {
     });
 
     it('completion message includes auto-verified when status is verified', async () => {
-      const output = makeAgentOutput(3, 'All changes applied.');
+      const output = makeAgentOutput(3, 'All changes applied.' + VERIFICATION_PASSED);
       vi.mocked(secureFs.readFile).mockResolvedValue(output);
 
       const svc = createServiceWithMocks();
@@ -1885,7 +2031,8 @@ describe('execution-service.ts', () => {
         '🔧 Tool: Read\nReading file...\n🔧 Tool: Edit\nEditing file...\n' +
         'The implementation is complete. Here is a detailed description of what was done. '.repeat(
           3
-        );
+        ) +
+        VERIFICATION_PASSED;
       vi.mocked(secureFs.readFile).mockResolvedValue(specificOutput);
 
       const svc = createServiceWithMocks();
@@ -1924,7 +2071,8 @@ describe('execution-service.ts', () => {
         '🔧 Tool: Read\n' +
         '🔧 Tool: Edit\n' +
         'Añadiendo función de búsqueda con caracteres especiales: ñ, ü, ö, é, 日本語テスト. ' +
-        'Die Änderungen wurden erfolgreich implementiert. '.repeat(3);
+        'Die Änderungen wurden erfolgreich implementiert. '.repeat(3) +
+        VERIFICATION_PASSED;
       vi.mocked(secureFs.readFile).mockResolvedValue(unicodeOutput);
 
       const svc = createServiceWithMocks();
